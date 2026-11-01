@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="ceb">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sorted Talk - Auto Open Mic</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        body { margin: 0; padding: 0; font-family: Arial, sans-serif; background: #121212; color: #fff; display: flex; flex-direction: column; height: 100vh; }
+        #header { background: #1f1f1f; padding: 10px 15px; display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #333; }
+        .input-group { display: flex; gap: 5px; }
+        input, button { padding: 8px 12px; border-radius: 4px; border: none; font-size: 14px; }
+        input { background: #2b2b2b; color: #fff; }
+        button { background: #f39c12; color: #000; font-weight: bold; cursor: pointer; }
+        button:hover { background: #e67e22; }
+        #map { flex: 1; width: 100%; z-index: 1; }
+        #status-bar { background: #1f1f1f; padding: 12px; text-align: center; font-size: 16px; border-top: 2px solid #333; }
+        .mic-active { color: #2ecc71; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <div id="header">
+        <div style="font-weight: bold; color: #f39c12;">Sorted Talk [Auto Mic]</div>
+        <div class="input-group">
+            <input type="text" id="channelInput" placeholder="Channel (e.g. 1)" value="CHANNEL-1">
+            <input type="text" id="usernameInput" placeholder="Imong Ngalan" value="Rider-1">
+            <button id="joinBtn" onclick="toggleJoin()">Join</button>
+        </div>
+    </div>
+
+    <div id="map"></div>
+
+    <div id="status-bar">
+        Status: <span id="statusText" class="mic-active">Wala pa naka-join sa frequency</span>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"></script>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        let map, ws = null;
+        let markers = {};
+        let myMarker = null;
+        let watchId = null;
+        let mediaRecorder = null;
+        let audioChunks = [];
+        let isConnected = false;
+
+        function initMap() {
+            map = L.map('map').setView([-43.5321, 172.6362], 13);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                maxZoom: 19,
+                attribution: '© OpenStreetMap'
+            }).addTo(map);
+        }
+
+        function toggleJoin() {
+            const channel = document.getElementById('channelInput').value.trim();
+            const username = document.getElementById('usernameInput').value.trim();
+            const btn = document.getElementById('joinBtn');
+
+            if (!channel || !username) {
+                alert("Palihug i-butang ang Channel ug Ngalan.");
+                return;
+            }
+
+            if (!isConnected) {
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const wsUrl = `${protocol}//${window.location.host}/ws/${channel}/${username}`;
+                
+                ws = new WebSocket(wsUrl);
+
+                ws.onopen = () => {
+                    isConnected = true;
+                    btn.textContent = "Leave";
+                    btn.style.background = "#e74c3c";
+                    document.getElementById('statusText.textContent').innerText = "Naa na sa Frequency - Auto Mic Active";
+                    startGPS();
+                    startAutoMic();
+                };
+
+                ws.onmessage = async (event) => {
+                    if (typeof event.data === 'string') {
+                        try {
+                            const data = JSON.parse(event.data);
+                            if (data.type === 'location') {
+                                updateMapMarker(data.username, data.lat, data.lng);
+                            }
+                        } catch (e) {
+                            // Basig audio base64 string
+                        }
+                    } else {
+                        // Dawata ang audio blob gikan sa uban
+                        const audioBlob = new Blob([event.data], { type: 'audio/webm' });
+                        const audioUrl = URL.createObjectURL(audioBlob);
+                        const audio = new Audio(audioUrl);
+                        audio.play().catch(e => console.log("Audio play error:", e));
+                    }
+                };
+
+                ws.onclose = () => {
+                    stopSession();
+                };
+            } else {
+                stopSession();
+            }
+        }
+
+        function stopSession() {
+            if (ws) ws.close();
+            if (watchId) navigator.geolocation.clearWatch(watchId);
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                mediaRecorder.stop();
+            }
+            isConnected = false;
+            document.getElementById('joinBtn').textContent = "Join";
+            document.getElementById('joinBtn').style.background = "#f39c12";
+            document.getElementById('statusText').innerText = "Wala pa naka-join sa frequency";
+        }
+
+        function startGPS() {
+            if (navigator.geolocation) {
+                watchId = navigator.geolocation.watchPosition(position => {
+                    const lat = position.coords.latitude;
+                    const lng = position.coords.longitude;
+                    
+                    if (!myMarker) {
+                        myMarker = L.marker([lat, lng]).addTo(map).bindPopup("Ikaw").openPopup();
+                    } else {
+                        myMarker.setLatLng([lat, lng]);
+                    }
+                    map.setView([lat, lng], 15);
+
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({
+                            type: 'location',
+                            username: document.getElementById('usernameInput').value,
+                            lat: lat,
+                            lng: lng
+                        }));
+                    }
+                }, error => console.error(error), { enableHighAccuracy: true });
+            }
+        }
+
+        async function startAutoMic() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+
+                mediaRecorder.ondataavailable = event => {
+                    if (event.data.size > 0 && ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(event.data); // I-send diretso ang audio chunk sa uban
+                    }
+                };
+
+                // Mag-rekord kada 1 ka segundo unya i-send dayon automatic
+                mediaRecorder.start(1000);
+
+                // I-restart ang recorder matag 1 segundo aron padayon ang stream
+                setInterval(() => {
+                    if (isConnected && mediaRecorder && mediaRecorder.state === 'recording') {
+                        mediaRecorder.stop();
+                        mediaRecorder.start(1000);
+                    }
+                }, 1000);
+
+            } catch (err) {
+                alert("Dili ma-access ang mikropono: " + err);
+            }
+        }
+
+        function updateMapMarker(username, lat, lng) {
+            if (markers[username]) {
+                markers[username].setLatLng([lat, lng]);
+            } else {
+                markers[username] = L.marker([lat, lng]).addTo(map).bindPopup(username);
+            }
+        }
+
+        window.onload = () => { initMap(); };
+    </script>
+</body>
+</html>
